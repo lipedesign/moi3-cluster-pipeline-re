@@ -1,0 +1,22 @@
+# build artifacts
+*.o
+*.a
+*.out
+*.so
+build/
+out/
+
+# editor / OS
+.DS_Store
+*.swp
+
+# local captures / firmware-derived data — NEVER commit these
+*.ppm
+*.nv12
+*.yuv
+*.bin
+*.img
+*.mp4
+frames/
+sysroot/
+fw-bins/
