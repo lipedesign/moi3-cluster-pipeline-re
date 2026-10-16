@@ -10,6 +10,37 @@ aqui depende de derrotar Secure Boot, dm-verity, assinatura VW ou SMACK, e nada 
 execução de código na unidade (fora de escopo). É o contrato do protocolo `ivi_share` do lado do
 consumidor, que a nossa bancada precisa satisfazer para o binário real transmitir de ponta a ponta.
 
+## Como o mss escolhe o surface (camada RSI, acima do `startShareInternal`)
+
+O `startShareInternal` recebe um `surface_id` já pronto. Quem o **escolhe** é a camada RSI
+`DisplayManagement` do próprio mss (adicionado em 16/10/2026, RE com REA / Ghidra 12.1.4 sobre o
+mesmo binário, base `0x100000`). O mss tem um `MultiScreenController` que **espelha** os três
+recursos RSI — `Display`, `RenderingSurface`, `StreamParameters` (cada um com `fromJSON`) — e os
+mantém em mapas, reagindo quando o recurso muda.
+
+O coração é **`MultiScreenController::prepareStreamsList` (`@0x130028`)**. Para cada
+`renderingSurface` do mapa:
+
+1. resolve `getDisplayById(rs.display)` e `getStreamParametersById(rs.streamParameters)`;
+2. só segue se a `renderingSurface` estiver listada no **`currentVisibleSurfaces`** do display (gate
+   de visibilidade);
+3. **extrai a fonte** do campo **`name`**: normaliza (trim + lowercase, `getPreparedSurfaceId
+   @0x12f278`) e compara os **12 primeiros chars** com `"surfaceid://"` (`@0x13ff90`, 12 chars
+   exatos). Se casa, `substr(12)` → o resto é o **id inteiro do surface IVI** a capturar; senão, cai
+   no `internalIdentifier` da `renderingSurface`;
+4. monta um `StreamInfo{ id, name, streamParametersId, sourceSurfaceId, ip, port, framerate }` (o
+   `ip`/`port`/`framerate` vêm do `StreamParameters`: campos `+0x70`/`+0x90`/`+0x68`) e chama
+   **`updateStreamsList` (`@0x12f9e8`)**, que inicia/para as tarefas `ShareServer` por surface — ou
+   seja, é o caminho que acaba em `START STREAMING` → `startShareInternal` (abaixo).
+
+Campos JSON do `RenderingSurface::fromJSON` (`@0x128168`): `name`, `internalIdentifier`, `display`,
+`topLeftX`, `topLeftY`, `width`, `height`, `streamParameters`. **Conclusão:** o mss **não** é preso
+ao surface do engine nativo — o `surface_id` que entra no `startShareInternal` sai do campo de fonte
+da `renderingSurface` (`name=surfaceid://<id>`, ou `internalIdentifier`). Isto é caminho de
+**exibição**; publicar essa `renderingSurface` numa unidade real exige execução de código, que é
+fora de escopo. A arquitetura RSI completa (lados consumidor e publicador, e a reconciliação de
+framerate) está no repo de pesquisa, em `cluster-map.md` §3.3.1/§3.4/§6.
+
 ## Função de entrada
 
 `ShareServer::startShareInternal(std::string dest, int, int surface_id, int fps)` — `FUN_001175d0 @ 0x1175d0`.

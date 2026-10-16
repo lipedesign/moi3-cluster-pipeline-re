@@ -23,7 +23,7 @@ flowchart LR
     ENC -->|"RTP/UDP · IPv6 multicast<br/>ff14::2:4 : 42800 · VLAN 5"| CL["instrument cluster ECU<br/>(separate) · decodes · displays"]
 ```
 
-Full state-machine RE in **[docs/shareserver-pipeline.md](docs/shareserver-pipeline.md)**; the `ivi_share` protocol in **[docs/ivi-share-protocol.md](docs/ivi-share-protocol.md)**; the risk-first milestone plan in **[docs/design.md](docs/design.md)**.
+Full state-machine RE — including how the server picks its source surface from the RSI `DisplayManagement` model (`surfaceid://`) — in **[docs/shareserver-pipeline.md](docs/shareserver-pipeline.md)**; the `ivi_share` protocol in **[docs/ivi-share-protocol.md](docs/ivi-share-protocol.md)**; the risk-first milestone plan in **[docs/design.md](docs/design.md)**.
 
 ## ✅ Does it convert? (bench result)
 
