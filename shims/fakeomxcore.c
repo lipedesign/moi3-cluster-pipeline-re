@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include "omx_il.h"
 
 #define LOGF(...) do { fprintf(stderr, "[fakeomx] " __VA_ARGS__); fflush(stderr); } while (0)
@@ -40,9 +43,56 @@ struct enc {
     int in_alloc, out_alloc, want_idle;
     pthread_t th; pthread_mutex_t mx; pthread_cond_t cv; int running;
     struct job q[QN]; int qh, qt;
+    OMX_BUFFERHEADERTYPE *outq[QN]; int outh, outt;   /* saídas primadas (FillThisBuffer), livres p/ encode */
+    int enc_fd; unsigned long long frame_no;           /* socket do daemon encoder + timestamp */
 };
 static struct enc *E(OMX_HANDLETYPE h) { return (struct enc *)h; }
 static int buffers_ok(struct enc *e) { return e->in_alloc >= (int)e->in_cnt && e->out_alloc >= (int)e->out_cnt; }
+
+/* === host x264 encoder forwarding ===
+ * x264/openh264 não linkam neste shim (-nostdlib contra a glibc 2.23 do FW), então o encoder real
+ * roda no host (enc_daemon.py, PyAV/libx264). Encaminhamos o NV12 por um unix socket e recebemos
+ * H.264 Annex-B. Protocolo: req "ENC0"(4) w(4) h(4) size(4) + NV12; resp nal(4) flags(4) + bytes. */
+static int enc_writen(int fd, const void *p, size_t n)
+{ const char *b = p; while (n) { ssize_t r = write(fd, b, n); if (r <= 0) return -1; b += r; n -= (size_t)r; } return 0; }
+static int enc_readn(int fd, void *p, size_t n)
+{ char *b = p; while (n) { ssize_t r = read(fd, b, n); if (r <= 0) return -1; b += r; n -= (size_t)r; } return 0; }
+static void put32(unsigned char *p, OMX_U32 v) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24); }
+static OMX_U32 get32(const unsigned char *p) { return (OMX_U32)p[0] | ((OMX_U32)p[1] << 8) | ((OMX_U32)p[2] << 16) | ((OMX_U32)p[3] << 24); }
+static int enc_connect(void)
+{
+    const char *path = getenv("MOI3_ENC_SOCKET");
+    if (!path || !*path) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, path, sizeof a.sun_path - 1);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    LOGF("encoder daemon conectado em %s (fd %d)\n", path, fd);
+    return fd;
+}
+static OMX_U32 enc_frame(struct enc *e, const OMX_U8 *nv12, OMX_U32 size, OMX_U8 *out, OMX_U32 outcap, OMX_U32 *flags)
+{
+    unsigned char hdr[16], rh[8]; OMX_U32 nal, fl, take, rest;
+    *flags = 0;
+    if (e->enc_fd < 0) e->enc_fd = enc_connect();
+    if (e->enc_fd < 0) return 0;
+    memcpy(hdr, "ENC0", 4); put32(hdr + 4, e->w); put32(hdr + 8, e->h); put32(hdr + 12, size);
+    if (enc_writen(e->enc_fd, hdr, 16) || enc_writen(e->enc_fd, nv12, size)) goto fail;
+    if (enc_readn(e->enc_fd, rh, 8)) goto fail;
+    nal = get32(rh); fl = get32(rh + 4);
+    take = nal < outcap ? nal : outcap;
+    if (take && enc_readn(e->enc_fd, out, take)) goto fail;
+    rest = nal - take;                       /* drena o excedente p/ não dessincronizar o stream */
+    while (rest) { char tmp[4096]; OMX_U32 c = rest < sizeof tmp ? rest : (OMX_U32)sizeof tmp; if (enc_readn(e->enc_fd, tmp, c)) goto fail; rest -= c; }
+    *flags = fl;
+    return take;
+fail:
+    LOGF("encoder forward falhou; fechando fd %d\n", e->enc_fd);
+    if (e->enc_fd >= 0) close(e->enc_fd);
+    e->enc_fd = -1;
+    return 0;
+}
 
 static void evt_cmdcomplete(struct enc *e, OMX_U32 data2)
 { if (e->cb.EventHandler) e->cb.EventHandler(&e->comp, e->appdata, OMX_EventCmdComplete, OMX_CommandStateSet, data2, NULL); }
@@ -67,8 +117,28 @@ static void *worker(void *arg)
             struct job j = e->q[e->qh]; e->qh = (e->qh + 1) % QN;
             pthread_mutex_unlock(&e->mx);
             if (j.kind == J_STATE) { e->state = (OMX_STATETYPE)j.state; LOGF("state -> %u (async)\n", j.state); evt_cmdcomplete(e, j.state); }
-            else if (j.kind == J_ETB) { LOGF("EmptyBufferDone\n"); if (e->cb.EmptyBufferDone) e->cb.EmptyBufferDone(&e->comp, e->appdata, j.buf); }
-            else if (j.kind == J_FTB) { if (j.buf) { j.buf->nFilledLen = 0; j.buf->nFlags = 0; } if (e->cb.FillBufferDone) e->cb.FillBufferDone(&e->comp, e->appdata, j.buf); }
+            else if (j.kind == J_ETB) {
+                OMX_BUFFERHEADERTYPE *in = j.buf, *out = NULL;
+                if (e->outh != e->outt) { out = e->outq[e->outh]; e->outh = (e->outh + 1) % QN; }  /* saída livre */
+                if (out && in && in->pBuffer && in->nFilledLen) {
+                    OMX_U32 fl = 0;
+                    OMX_U32 nal = enc_frame(e, in->pBuffer, in->nFilledLen, out->pBuffer, out->nAllocLen, &fl);
+                    out->nFilledLen = nal; out->nOffset = 0;
+                    out->nTimeStamp = (OMX_TICKS)(e->frame_no * 33333);
+                    out->nFlags = 0x10u /*ENDOFFRAME*/ | ((fl & 1u) ? 0x20u /*SYNCFRAME*/ : 0u);
+                    e->frame_no++;
+                    if (e->frame_no <= 5 || e->frame_no % 60 == 0)
+                        LOGF("encoded frame #%llu -> %u bytes (idr=%d)\n", e->frame_no, nal, (int)(fl & 1u));
+                    if (e->cb.FillBufferDone) e->cb.FillBufferDone(&e->comp, e->appdata, out);
+                } else if (out) {                         /* sem input: devolve saída vazia p/ reciclar */
+                    out->nFilledLen = 0; out->nFlags = 0;
+                    if (e->cb.FillBufferDone) e->cb.FillBufferDone(&e->comp, e->appdata, out);
+                }
+                if (e->cb.EmptyBufferDone) e->cb.EmptyBufferDone(&e->comp, e->appdata, in);
+            }
+            else if (j.kind == J_FTB) {                   /* segura a saída primada p/ o próximo encode */
+                if (j.buf) { e->outq[e->outt] = j.buf; e->outt = (e->outt + 1) % QN; }
+            }
             pthread_mutex_lock(&e->mx);
         }
     }
@@ -167,7 +237,7 @@ static OMX_ERRORTYPE c_AllocateBuffer(OMX_HANDLETYPE h, OMX_BUFFERHEADERTYPE **p
 static OMX_ERRORTYPE c_FreeBuffer(OMX_HANDLETYPE h, OMX_U32 port, OMX_BUFFERHEADERTYPE *b) { (void)h; (void)port; if (b) free(b); return OMX_ErrorNone; }
 
 static OMX_ERRORTYPE c_EmptyThisBuffer(OMX_HANDLETYPE h, OMX_BUFFERHEADERTYPE *b)
-{ LOGF("EmptyThisBuffer filled=%u flags=%#x\n", b ? b->nFilledLen : 0, b ? b->nFlags : 0); enq(E(h), J_ETB, 0, b); return OMX_ErrorNone; }
+{ enq(E(h), J_ETB, 0, b); return OMX_ErrorNone; }
 static OMX_ERRORTYPE c_FillThisBuffer(OMX_HANDLETYPE h, OMX_BUFFERHEADERTYPE *b)
 { LOGF("FillThisBuffer alloc=%u\n", b ? b->nAllocLen : 0); enq(E(h), J_FTB, 0, b); return OMX_ErrorNone; }
 static OMX_ERRORTYPE c_SetCallbacks(OMX_HANDLETYPE h, OMX_CALLBACKTYPE *cb, OMX_PTR app)
@@ -189,6 +259,7 @@ OMX_ERRORTYPE OMX_GetHandle(OMX_HANDLETYPE *pHandle, OMX_STRING name, OMX_PTR ap
     LOGF("OMX_GetHandle(%s)\n", name ? name : "?");
     e->state = OMX_StateLoaded; e->w = ENC_W; e->h = ENC_H; e->bitrate = 4000000;
     e->in_cnt = 2; e->out_cnt = 2; e->in_sz = ENC_W * ENC_H * 3 / 2; e->out_sz = ENC_W * ENC_H;
+    e->enc_fd = -1;   /* lazy-connect ao daemon encoder no 1o frame */
     if (cb) e->cb = *cb;
     e->appdata = appData;
     pthread_mutex_init(&e->mx, NULL); pthread_cond_init(&e->cv, NULL);

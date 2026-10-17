@@ -52,7 +52,7 @@ typedef enum OMX_EVENTTYPE {
 } OMX_EVENTTYPE;
 
 typedef int OMX_INDEXTYPE;   /* standard OMX_IndexParam* values compared numerically where needed */
-#define OMX_IndexParamPortDefinition      0x02000003
+#define OMX_IndexParamPortDefinition      0x02000001
 #define OMX_IndexParamVideoInit           0x02000006
 #define OMX_IndexParamVideoPortFormat     0x02000020
 #define OMX_IndexParamVideoBitrate        0x02000021

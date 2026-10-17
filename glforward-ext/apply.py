@@ -24,7 +24,8 @@ proto = os.path.join(out, "proto.h")
 patch(proto, "enum {", r'''
     OPX_IMG_CREATE = 90,    /* w,h,stride,fourcc, blob pixels -> handle (EGLImage from a GL texture) */
     OPX_IMG_TARGET = 91,    /* target, handle (no reply) */
-    OPX_CLIENT_ARRAY = 92,  /* idx,size,type,norm,stride, blob -> transient VBO for a client-side array */''', after=True)
+    OPX_CLIENT_ARRAY = 92,  /* idx,size,type,norm,stride, blob -> transient VBO for a client-side array */
+    OPX_READBACK = 93,      /* (no args) -> fbo_out_handle, w, h, size, blob pixels (render-to-external write-back) */''', after=True)
 
 # --- shim.c: the import entrypoints, inserted right after the generated shim include ---
 SHIM_FUNCS = r'''
@@ -61,6 +62,7 @@ void *eglCreateImageKHR(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClien
     W_call();
     uint64_t handle = R_u64();
     W_done();
+    moi3_oimg_store(handle, fd, w, h, stride);   /* remember fd+geom for render-to-external write-back */
     munmap(pm, sz);
     fprintf(stderr, "[glfwd/img] image handle=%llu\n", (unsigned long long)handle);
     return (void *)(uintptr_t)handle;
@@ -127,6 +129,37 @@ patch(os.path.join(out, "gen", "shim_gen.inc"),
       "void glDrawArrays(GLenum mode, GLint first, GLsizei count) {",
       "\n  moi3_send_client_arrays(first, count);", after=True)
 
+# --- shim.c: render-to-external write-back. Remember each imported image's dma-buf fd+geometry; at
+# glFinish (the mss syncs the GPU before the encoder reads the output bo) ask glhost for the rendered
+# pixels of the current FBO target and write them into that bo, so the encoder sees the converted NV12. ---
+SHIM_WB = r'''/* === render-to-external write-back (moi3-cluster-pipeline-re) === */
+#include <sys/mman.h>
+static struct moi3_oimg { int fd; unsigned w, h, stride; } g_oimg[256];
+static void moi3_oimg_store(uint64_t handle, int fd, unsigned w, unsigned h, unsigned stride) {
+    if (handle >= 1 && handle < 256) { g_oimg[handle].fd = fd; g_oimg[handle].w = w;
+        g_oimg[handle].h = h; g_oimg[handle].stride = stride ? stride : w * 4; }
+}
+static void moi3_writeback(void) {
+    W_begin(OPX_READBACK); W_call();
+    uint64_t handle = R_u64(), w = R_u64(), h = R_u64(), size = R_u64();
+    (void)w; (void)h;
+    if (handle >= 1 && handle < 256 && g_oimg[handle].fd > 0 && size) {
+        size_t bo = (size_t)g_oimg[handle].stride * g_oimg[handle].h;
+        if (!bo) bo = (size_t)size;
+        size_t n = (size_t)size < bo ? (size_t)size : bo;
+        void *m = mmap(0, bo, PROT_READ | PROT_WRITE, MAP_SHARED, g_oimg[handle].fd, 0);
+        if (m != MAP_FAILED) { R_copy(m, n); munmap(m, bo); }
+        else R_copy(0, n);
+    } else R_copy(0, (size_t)size);
+    W_done();
+}
+'''
+patch(shim, "void glFinish(void)", SHIM_WB, after=False)
+# call the write-back right after glFinish forwards (FBO + viewport still bound on glhost)
+patch(shim,
+      "    W_begin(OP_glFinish);\n    W_call();\n    (void)R_u64();\n    W_done();",
+      "\n    moi3_writeback();", after=True)
+
 # --- host.c: globals + the two op handlers ---
 HOST_TOP = r'''
 #include <EGL/eglext.h>
@@ -135,6 +168,14 @@ HOST_TOP = r'''
 static void *g_img_slots[256]; static int g_img_n;
 static PFNEGLCREATEIMAGEKHRPROC g_realCreateImage;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC g_realTargetTex;
+/* === render-to-external emulation (moi3): Mesa llvmpipe rejects GL_TEXTURE_EXTERNAL_OES as an FBO
+ * color attachment (render-to-EGLImage, which Adreno allows). Each imported EGLImage already has a
+ * backing GL_TEXTURE_2D in glhost; when the mss attaches an external texture to an FBO we swap in that
+ * backing 2D texture (renderable), render into it, and later read it back into the output dma-buf. */
+static GLuint g_img_tex[256];       /* backing GL_TEXTURE_2D for image handle (1-based) */
+static GLuint g_ext_backing[1024];  /* external texture name -> backing GL_TEXTURE_2D */
+static int    g_ext_handle[1024];   /* external texture name -> image handle (for write-back) */
+static int    g_fbo_out_handle;     /* image handle whose backing is the current FBO color target */
 /* transient VBOs staged for client-side arrays (OPX_CLIENT_ARRAY), freed after each glDrawArrays */
 static GLuint g_tmpvbo[16]; static int g_tmpvbo_n;
 static void moi3_cleanup_arrays(void) {
@@ -238,7 +279,7 @@ HOST_CASES = r'''    case OPX_CLIENT_ARRAY: {
         if (g_realCreateImage) {
             EGLint ia[] = { EGL_GL_TEXTURE_LEVEL_KHR, 0, EGL_NONE };
             EGLImageKHR img = g_realCreateImage(D, g_cur_ctx, EGL_GL_TEXTURE_2D_KHR, (EGLClientBuffer)(uintptr_t)tex, ia);
-            if (img != EGL_NO_IMAGE_KHR && g_img_n < 256) { g_img_slots[g_img_n] = img; handle = (uint64_t)(++g_img_n); }
+            if (img != EGL_NO_IMAGE_KHR && g_img_n < 256) { g_img_slots[g_img_n] = img; g_img_tex[g_img_n] = tex; handle = (uint64_t)(++g_img_n); }
             LOG("[glhost] IMG_CREATE %llux%llu fourcc=%#llx glerr=%#x -> img %p handle %llu\n",
                 (unsigned long long)w, (unsigned long long)h, (unsigned long long)fourcc, glGetError(), img, (unsigned long long)handle);
         } else LOG("[glhost] IMG_CREATE: no eglCreateImageKHR in Mesa\n");
@@ -247,7 +288,64 @@ HOST_CASES = r'''    case OPX_CLIENT_ARRAY: {
     case OPX_IMG_TARGET: {
         uint64_t target = R_u64(), handle = R_u64();
         if (handle >= 1 && handle <= (uint64_t)g_img_n && g_realTargetTex) g_realTargetTex((GLenum)target, g_img_slots[handle - 1]);
+        if (handle >= 1 && handle <= (uint64_t)g_img_n) {   /* map the bound external texture -> its backing 2D tex */
+            GLint cur = 0; glGetIntegerv(0x8D67 /*GL_TEXTURE_BINDING_EXTERNAL_OES*/, &cur);
+            if (cur > 0 && cur < 1024) { g_ext_backing[cur] = g_img_tex[handle - 1]; g_ext_handle[cur] = (int)handle;
+                LOG("[glhost] ext tex %d -> backing 2D %u (img handle %llu)\n", cur, g_img_tex[handle - 1], (unsigned long long)handle); }
+        }
         LOG("[glhost] IMG_TARGET target=%#llx handle=%llu glerr=%#x\n", (unsigned long long)target, (unsigned long long)handle, glGetError());
+    } return 1;
+    case OPX_READBACK: {   /* read the current FBO (the Rgba2yuv render target) back for write-back to the bo */
+        int h = g_fbo_out_handle;
+        if (getenv("MOI3_ENC_PATTERN")) {
+            /* DEMO: a bancada não tem cluster real (grab preto) e o shader é um remap Venus (não NV12).
+             * Gera um NV12 reconhecível em movimento (barras SMPTE + barra branca varrendo + faixa de
+             * gradiente no topo) no ponto onde o frame convertido iria, p/ ver conteúdo fluindo até o RTP. */
+            static int fno = 0; fno++;
+            int W = 1280, H = 480; size_t ysz = (size_t)W * H, sz2 = ysz + ysz / 2;
+            P_u64((uint64_t)h); P_u64((uint64_t)W); P_u64((uint64_t)H); P_u64((uint64_t)sz2);
+            unsigned char *buf = (unsigned char *)P_reserve(sz2);
+            unsigned char *Y = buf, *UV = buf + ysz;
+            static const unsigned char bY[8] = {235,210,170,145,106,81,41,16};
+            static const unsigned char bU[8] = {128,16,166,54,202,90,240,128};
+            static const unsigned char bV[8] = {128,146,16,34,222,240,110,128};
+            int barw = W / 8, sweep = (fno * 24) % W;
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                int b = x / barw; if (b > 7) b = 7;
+                unsigned char yy = bY[b];
+                if (y < 24) yy = (unsigned char)(x * 255 / W);         /* faixa de gradiente no topo */
+                else if (x >= sweep && x < sweep + 24) yy = 235;       /* barra branca varrendo */
+                Y[(size_t)y * W + x] = yy;
+            }
+            for (int y = 0; y < H / 2; y++) for (int x = 0; x < W / 2; x++) {
+                int b = (x * 2) / barw; if (b > 7) b = 7;
+                UV[((size_t)y * (W / 2) + x) * 2]     = (y < 12) ? 128 : bU[b];
+                UV[((size_t)y * (W / 2) + x) * 2 + 1] = (y < 12) ? 128 : bV[b];
+            }
+            if (fno <= 3) LOG("[glhost] READBACK PATTERN frame %d (%dx%d NV12 %zu B)\n", fno, W, H, sz2);
+            REPLY();
+            return 1;
+        }
+        GLint vp[4] = {0,0,0,0}; glGetIntegerv(GL_VIEWPORT, vp);
+        uint64_t w = vp[2] > 0 ? (uint64_t)vp[2] : 1280, hh = vp[3] > 0 ? (uint64_t)vp[3] : 480;
+        uint64_t sz = w * hh * 4;
+        P_u64((uint64_t)h); P_u64(w); P_u64(hh); P_u64(sz);
+        void *buf = P_reserve((size_t)sz);
+        /* glReadPixels devolve de baixo p/ cima (origem GL embaixo); o encoder lê o bo de cima p/ baixo.
+         * Lê num scratch e copia invertido na vertical, p/ o NV12 (primeiras linhas do FBO) ficar no começo. */
+        unsigned char *scratch = (unsigned char *)malloc((size_t)sz);
+        if (scratch) {
+            glReadPixels(0, 0, (GLsizei)w, (GLsizei)hh, GL_RGBA, GL_UNSIGNED_BYTE, scratch);
+            size_t rowb = (size_t)w * 4;
+            for (uint64_t r = 0; r < hh; r++)
+                memcpy((unsigned char *)buf + r * rowb, scratch + (hh - 1 - r) * rowb, rowb);
+            free(scratch);
+        } else {
+            glReadPixels(0, 0, (GLsizei)w, (GLsizei)hh, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+        }
+        LOG("[glhost] READBACK handle=%d %llux%llu sz=%llu glerr=%#x (flip V)\n", h,
+            (unsigned long long)w, (unsigned long long)hh, (unsigned long long)sz, glGetError());
+        REPLY();
     } return 1;
 '''
 patch(host, "    case OPX_HELLO: {", HOST_CASES, after=False)
@@ -269,6 +367,17 @@ patch(hostgen, "  *ret_ = (uint64_t)glCreateShader(type);",
 # shader renders nothing. Clamp a zero viewport to the stream size so the quad covers the frame.
 patch(hostgen, "  glViewport(x, y, width, height);",
       "  if (width <= 0) width = 1280;\n  if (height <= 0) height = 480;\n", after=False)
+
+# render-to-external emulation: the mss attaches its NV12 output EGLImage to the FBO as a
+# GL_TEXTURE_EXTERNAL_OES color attachment, which Mesa rejects. Swap in the backing GL_TEXTURE_2D
+# (renderable) so the FBO completes and the Rgba2yuv shader renders into it. g_fbo_out_handle
+# remembers which image this FBO targets, for the read-back into the dma-buf after the draw.
+patch(hostgen, "  glFramebufferTexture2D(target, attachment, textarget, texture, level);",
+      "  if (textarget == 0x8d65 /*GL_TEXTURE_EXTERNAL_OES*/ && texture < 1024 && g_ext_backing[texture]) {\n"
+      "    LOG(\"[glhost] FBO render-to-external: ext %u -> backing 2D %u (img %d)\\n\", texture, g_ext_backing[texture], g_ext_handle[texture]);\n"
+      "    g_fbo_out_handle = g_ext_handle[texture];\n"
+      "    textarget = GL_TEXTURE_2D; texture = g_ext_backing[texture];\n"
+      "  }\n", after=False)
 
 
 print("patched OK:", out)

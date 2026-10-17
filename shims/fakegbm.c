@@ -95,6 +95,46 @@ uint32_t gbm_bo_get_stride(struct gbm_bo *bo) { return bo ? bo->stride : 0; }
 uint32_t gbm_bo_get_width(struct gbm_bo *bo) { return bo ? bo->w : 0; }
 uint32_t gbm_bo_get_format(struct gbm_bo *bo) { return bo ? bo->format : 0; }
 
-/* Qualcomm extension: int gbm_perform(int operation, ...). Logged; returns 0 (GBM_ERROR_NONE)
- * until we see which operations the mss actually needs. */
-int gbm_perform(int op, ...) { LOGF("gbm_perform(op=%d) [stub -> 0]\n", op); return 0; }
+/* Qualcomm extension: int gbm_perform(int operation, ...). The mss's cb_damage (memcpy mode) uses
+ * three ops per frame: op 8 = "is this bo CPU-mappable/linear?" (return non-zero so it proceeds and
+ * computes size = stride*height), op 6 = CPU map (hand back a readable pointer to bo->size bytes),
+ * op 7 = CPU unmap. Without a real map the pass buffer stays empty and the encoder is never fed
+ * (RE 17/10/2026: feeder gate requires passbuf!=0). We map the imported dma-buf when its fd is at
+ * least bo->size (real pixels); otherwise an anonymous zeroed page of bo->size (a blank frame — safe,
+ * no SIGBUS). The copy in the mss is clamped to the input buffer's nAllocLen, so no overflow. */
+int gbm_perform(int op, ...)
+{
+    va_list ap; va_start(ap, op);
+    int ret = 0;
+    if (op == 8) {                     /* query: report mappable/linear so cb_damage CPU-maps */
+        ret = 1;
+    } else if (op == 6 || op == 7) {   /* 6 = CPU map, 7 = CPU unmap; args: (bo, void **out) */
+        struct gbm_bo *bo = va_arg(ap, struct gbm_bo *);
+        void **out = va_arg(ap, void **);
+        uint64_t sz = bo ? bo->size : 0;
+        if (op == 6) {
+            void *p = MAP_FAILED;
+            /* glibc 2.23 (firmware) does not export fstat (it inlines to __fxstat); use lseek,
+             * a real exported symbol, to size the fd before mapping it (avoids SIGBUS). */
+            if (bo && bo->memfd >= 0 && sz) {
+                off_t end = lseek(bo->memfd, 0, SEEK_END);
+                if (end >= 0) lseek(bo->memfd, 0, SEEK_SET);
+                if (end >= 0 && (uint64_t)end >= sz)
+                    p = mmap(NULL, sz, PROT_READ, MAP_SHARED, bo->memfd, 0);    /* real dma-buf */
+            }
+            if (p == MAP_FAILED && sz)
+                p = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);                   /* blank fallback */
+            if (out) *out = (p == MAP_FAILED) ? (void *)-1 : p;
+            LOGF("gbm_perform(6 map) bo=%p size=%llu -> %p\n", (void *)bo,
+                 (unsigned long long)sz, out ? *out : (void *)0);
+        } else {
+            if (bo && out && *out && *out != (void *)-1) munmap(*out, sz);
+            LOGF("gbm_perform(7 unmap) bo=%p\n", (void *)bo);
+        }
+    } else {
+        LOGF("gbm_perform(op=%d) [stub -> 0]\n", op);
+    }
+    va_end(ap);
+    return ret;
+}
