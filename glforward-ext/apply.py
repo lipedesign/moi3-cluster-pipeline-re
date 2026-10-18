@@ -326,25 +326,37 @@ HOST_CASES = r'''    case OPX_CLIENT_ARRAY: {
             REPLY();
             return 1;
         }
+        /* CONTEÚDO REAL: lê o FBO (saída do shader sobre o surface grabado) em RGBA e converte
+         * p/ NV12 (BT.601 limitado) já invertendo na vertical, p/ o encoder receber NV12 válido.
+         * Sem MOI3_ENC_PATTERN, isto faz o conteúdo REAL do grab atravessar encode->H.264. */
         GLint vp[4] = {0,0,0,0}; glGetIntegerv(GL_VIEWPORT, vp);
-        uint64_t w = vp[2] > 0 ? (uint64_t)vp[2] : 1280, hh = vp[3] > 0 ? (uint64_t)vp[3] : 480;
-        uint64_t sz = w * hh * 4;
-        P_u64((uint64_t)h); P_u64(w); P_u64(hh); P_u64(sz);
-        void *buf = P_reserve((size_t)sz);
-        /* glReadPixels devolve de baixo p/ cima (origem GL embaixo); o encoder lê o bo de cima p/ baixo.
-         * Lê num scratch e copia invertido na vertical, p/ o NV12 (primeiras linhas do FBO) ficar no começo. */
-        unsigned char *scratch = (unsigned char *)malloc((size_t)sz);
-        if (scratch) {
-            glReadPixels(0, 0, (GLsizei)w, (GLsizei)hh, GL_RGBA, GL_UNSIGNED_BYTE, scratch);
-            size_t rowb = (size_t)w * 4;
-            for (uint64_t r = 0; r < hh; r++)
-                memcpy((unsigned char *)buf + r * rowb, scratch + (hh - 1 - r) * rowb, rowb);
-            free(scratch);
-        } else {
-            glReadPixels(0, 0, (GLsizei)w, (GLsizei)hh, GL_RGBA, GL_UNSIGNED_BYTE, buf);
-        }
-        LOG("[glhost] READBACK handle=%d %llux%llu sz=%llu glerr=%#x (flip V)\n", h,
-            (unsigned long long)w, (unsigned long long)hh, (unsigned long long)sz, glGetError());
+        int W = vp[2] > 0 ? vp[2] : 1280, H = vp[3] > 0 ? vp[3] : 480;
+        size_t ysz = (size_t)W * H, sz = ysz + ysz / 2;
+        P_u64((uint64_t)h); P_u64((uint64_t)W); P_u64((uint64_t)H); P_u64((uint64_t)sz);
+        unsigned char *out = (unsigned char *)P_reserve(sz);
+        unsigned char *rgba = (unsigned char *)malloc(ysz * 4);
+        if (rgba) {
+            glReadPixels(0, 0, (GLsizei)W, (GLsizei)H, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+            unsigned char *Y = out, *UV = out + ysz;
+            for (int y = 0; y < H; y++) {
+                const unsigned char *s = rgba + (size_t)(H - 1 - y) * W * 4;   /* flip V */
+                for (int x = 0; x < W; x++) {
+                    int R = s[x*4], G = s[x*4+1], B = s[x*4+2];
+                    int yy = (66*R + 129*G + 25*B + 128) / 256 + 16;
+                    Y[(size_t)y*W + x] = (unsigned char)(yy < 16 ? 16 : yy > 235 ? 235 : yy);
+                }
+            }
+            for (int y = 0; y < H/2; y++) for (int x = 0; x < W/2; x++) {
+                const unsigned char *s = rgba + ((size_t)(H - 1 - 2*y) * W + 2*x) * 4;
+                int R = s[0], G = s[1], B = s[2];
+                int u = (-38*R - 74*G + 112*B + 128) / 256 + 128;
+                int v = (112*R - 94*G - 18*B + 128) / 256 + 128;
+                UV[((size_t)y*(W/2) + x)*2]     = (unsigned char)(u < 0 ? 0 : u > 255 ? 255 : u);
+                UV[((size_t)y*(W/2) + x)*2 + 1] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v);
+            }
+            free(rgba);
+        } else { memset(out, 0, sz); }
+        LOG("[glhost] READBACK REAL->NV12 handle=%d %dx%d sz=%zu glerr=%#x\n", h, W, H, sz, glGetError());
         REPLY();
     } return 1;
 '''
