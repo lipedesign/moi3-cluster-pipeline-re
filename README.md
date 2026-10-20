@@ -7,6 +7,7 @@
 ![platform](https://img.shields.io/badge/platform-MIB3%20MOI3%20LG-informational)
 ![scope](https://img.shields.io/badge/scope-bench%20%2F%20display-success)
 ![protections](https://img.shields.io/badge/protections-out%20of%20scope-lightgrey)
+[![altscreen — mib3-moi3-altscreen](https://img.shields.io/badge/%F0%9F%9A%97%20altscreen%20%E2%9A%A0%EF%B8%8F%20alpha-mib3--moi3--altscreen-ff6b35?logo=github&logoColor=white)](https://github.com/lipedesign/mib3-moi3-altscreen)
 
 ---
 
@@ -88,11 +89,16 @@ flowchart LR
 
 ## 🔬 Companion research
 
+[![research notes](https://img.shields.io/badge/%F0%9F%93%9D%20research-mib3--moi3--lg--research-1f6feb?logo=github&logoColor=white)](https://github.com/lipedesign/mib3-moi3-lg-research)
+[![altscreen](https://img.shields.io/badge/%F0%9F%9A%97%20altscreen%20%E2%9A%A0%EF%B8%8F%20alpha-mib3--moi3--altscreen-ff6b35?logo=github&logoColor=white)](https://github.com/lipedesign/mib3-moi3-altscreen)
+
 Prose research notes on the whole platform — architecture, firmware structure, the coding model, the cluster-map pipeline and the three "layers" of map-on-cluster — live in the companion repo:
 
-**→ [lipedesign/mib3-moi3-lg-research](https://github.com/lipedesign/mib3-moi3-lg-research)**
+**→ [lipedesign/mib3-moi3-lg-research](https://github.com/lipedesign/mib3-moi3-lg-research)** — the *what*; this one is the *how*, reproduced on a bench.
 
-That repo is the *what*; this one is the *how*, reproduced on a bench.
+The next step beyond the bench — intercepting the CarPlay AltScreen (stream type 111, 1280×480 H.264) and forwarding it to the real cluster hardware via MPEG-TS/RTP — is in:
+
+**→ [lipedesign/mib3-moi3-altscreen](https://github.com/lipedesign/mib3-moi3-altscreen)** ⚠️ **alpha — not yet tested on real hardware**
 
 ## 🤝 Contributing & security
 
